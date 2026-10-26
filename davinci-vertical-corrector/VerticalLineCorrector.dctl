@@ -1,0 +1,167 @@
+// Vertical Line Corrector for DaVinci Resolve
+//
+// Fixes keystoning (converging verticals) on tilted gimbal and drone shots by
+// re-projecting the frame from a virtual level camera with a shift lens.
+// Because only the camera rotation changes, walls, poles and building edges
+// come out straight and parallel instead of leaning in.
+//
+// Geometry is a direct port of tools/reference.py - test changes there first.
+// Coordinates below are pixel units, centred on the frame, +y up.
+
+DEFINE_UI_PARAMS(p_TiltV, Vertical Tilt, DCTLUI_SLIDER_FLOAT, 0.0, -60.0, 60.0, 0.1)
+DEFINE_UI_PARAMS(p_TiltH, Horizontal Tilt, DCTLUI_SLIDER_FLOAT, 0.0, -60.0, 60.0, 0.1)
+DEFINE_UI_PARAMS(p_Roll, Level Horizon, DCTLUI_SLIDER_FLOAT, 0.0, -45.0, 45.0, 0.05)
+DEFINE_UI_PARAMS(p_Amount, Correction Amount, DCTLUI_SLIDER_FLOAT, 100.0, 0.0, 150.0, 1.0)
+DEFINE_UI_PARAMS(p_FOV, Lens Horizontal FOV, DCTLUI_SLIDER_FLOAT, 82.0, 20.0, 140.0, 0.5)
+DEFINE_UI_PARAMS(p_Zoom, Zoom, DCTLUI_SLIDER_FLOAT, 1.0, 0.5, 3.0, 0.001)
+DEFINE_UI_PARAMS(p_ShiftX, Shift X, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.001)
+DEFINE_UI_PARAMS(p_ShiftY, Shift Y, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.001)
+DEFINE_UI_PARAMS(p_AutoFill, Auto Fill Frame, DCTLUI_CHECK_BOX, 1)
+DEFINE_UI_PARAMS(p_Edge, Edges, DCTLUI_COMBO_BOX, 0, { EDGE_BLACK, EDGE_EXTEND, EDGE_MIRROR }, { Black, Extend, Mirror })
+DEFINE_UI_PARAMS(p_Guides, Show Guide Grid, DCTLUI_CHECK_BOX, 0)
+
+#define DEG2RAD 0.01745329252f
+
+typedef struct
+{
+    float f;
+    float cp, sp, cy, sy, cr, sr;
+} Rig;
+
+// Level-camera pixel -> pixel in the tilted footage. z <= 0 means the ray
+// points behind the camera (only happens at extreme angles).
+__DEVICE__ float3 level_to_source(Rig r, float x, float y)
+{
+    float x1 = x * r.cy - r.f * r.sy;
+    float z1 = x * r.sy + r.f * r.cy;
+    float y2 = y * r.cp - z1 * r.sp;
+    float z2 = y * r.sp + z1 * r.cp;
+    float x3 = x1 * r.cr + y2 * r.sr;
+    float y3 = -x1 * r.sr + y2 * r.cr;
+    return make_float3(r.f * x3 / z2, r.f * y3 / z2, z2);
+}
+
+// Exact inverse of level_to_source: footage pixel -> level-camera pixel.
+__DEVICE__ float2 source_to_level(Rig r, float x, float y)
+{
+    float x1 = x * r.cr - y * r.sr;
+    float y1 = x * r.sr + y * r.cr;
+    float y2 = y1 * r.cp + r.f * r.sp;
+    float z2 = -y1 * r.sp + r.f * r.cp;
+    float x3 = x1 * r.cy + z2 * r.sy;
+    float z3 = -x1 * r.sy + z2 * r.cy;
+    z3 = _fmaxf(z3, 1e-6f);
+    return make_float2(r.f * x3 / z3, r.f * y2 / z3);
+}
+
+// How far a frame-aspect rect centred on (cx, cy) can grow before it crosses
+// the clockwise edge p -> q of the warped footage.
+__DEVICE__ float edge_fit(float2 p, float2 q, float a, float b, float cx, float cy)
+{
+    float nx = -(q.y - p.y);
+    float ny = q.x - p.x;
+    return (nx * (p.x - cx) + ny * (p.y - cy)) / (_fabs(nx) * a + _fabs(ny) * b + 1e-9f);
+}
+
+__DEVICE__ int wrap_coord(int v, int n, int mode)
+{
+    if (mode == EDGE_MIRROR) {
+        int period = 2 * n;
+        int m = v % period;
+        if (m < 0) m += period;
+        return m < n ? m : period - 1 - m;
+    }
+    return v < 0 ? 0 : (v > n - 1 ? n - 1 : v);
+}
+
+__DEVICE__ float3 lerp3(float3 a, float3 b, float t)
+{
+    return make_float3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t);
+}
+
+__DEVICE__ float3 fetch(__TEXTURE__ texR, __TEXTURE__ texG, __TEXTURE__ texB, int x, int y)
+{
+    return make_float3(_tex2D(texR, x, y), _tex2D(texG, x, y), _tex2D(texB, x, y));
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, __TEXTURE__ p_TexR, __TEXTURE__ p_TexG, __TEXTURE__ p_TexB)
+{
+    float W = (float)p_Width;
+    float H = (float)p_Height;
+    float hw = 0.5f * W;
+    float hh = 0.5f * H;
+    float amt = p_Amount * 0.01f * DEG2RAD;
+
+    Rig r;
+    r.f = hw / _tanf(0.5f * p_FOV * DEG2RAD);
+    r.cp = _cosf(p_TiltV * amt);  r.sp = _sinf(p_TiltV * amt);
+    r.cy = _cosf(p_TiltH * amt);  r.sy = _sinf(p_TiltH * amt);
+    r.cr = _cosf(p_Roll * amt);   r.sr = _sinf(p_Roll * amt);
+
+    // Shift-lens recentre: keep the middle of the shot in the middle of the
+    // frame instead of re-aiming the camera at the horizon.
+    float2 c0 = source_to_level(r, 0.0f, 0.0f);
+    float shx = c0.x + p_ShiftX * hw;
+    float shy = c0.y + p_ShiftY * hh;
+
+    // Auto fill: zoom just enough that no empty corners show.
+    float k = 1.0f;
+    if (p_AutoFill != 0) {
+        float2 tl = source_to_level(r, -hw,  hh);
+        float2 tr = source_to_level(r,  hw,  hh);
+        float2 br = source_to_level(r,  hw, -hh);
+        float2 bl = source_to_level(r, -hw, -hh);
+        k = edge_fit(tl, tr, hw, hh, shx, shy);
+        k = _fminf(k, edge_fit(tr, br, hw, hh, shx, shy));
+        k = _fminf(k, edge_fit(br, bl, hw, hh, shx, shy));
+        k = _fminf(k, edge_fit(bl, tl, hw, hh, shx, shy));
+        k = _fmaxf(k, 0.05f);
+    }
+    float scale = p_Zoom / k;
+
+    // Resolve's pixel grid has its origin top-left with y down.
+    float ox = (float)p_X + 0.5f - hw;
+    float oy = hh - ((float)p_Y + 0.5f);
+    float3 src = level_to_source(r, ox / scale + shx, oy / scale + shy);
+
+    float sx = src.x + hw - 0.5f;
+    float sy = hh - src.y - 0.5f;
+
+    float3 rgb;
+    int behind = src.z <= 1e-6f;
+    int outside = sx < -0.5f || sy < -0.5f || sx > W - 0.5f || sy > H - 0.5f;
+    if (behind || (p_Edge == EDGE_BLACK && outside)) {
+        rgb = make_float3(0.0f, 0.0f, 0.0f);
+    } else {
+        // Bilinear sample.
+        float fx = _floorf(sx);
+        float fy = _floorf(sy);
+        float tx = sx - fx;
+        float ty = sy - fy;
+        int x0 = wrap_coord((int)fx, p_Width, p_Edge);
+        int x1 = wrap_coord((int)fx + 1, p_Width, p_Edge);
+        int y0 = wrap_coord((int)fy, p_Height, p_Edge);
+        int y1 = wrap_coord((int)fy + 1, p_Height, p_Edge);
+        float3 c00 = fetch(p_TexR, p_TexG, p_TexB, x0, y0);
+        float3 c10 = fetch(p_TexR, p_TexG, p_TexB, x1, y0);
+        float3 c01 = fetch(p_TexR, p_TexG, p_TexB, x0, y1);
+        float3 c11 = fetch(p_TexR, p_TexG, p_TexB, x1, y1);
+        rgb = lerp3(lerp3(c00, c10, tx), lerp3(c01, c11, tx), ty);
+    }
+
+    // Guide grid to line up against walls while dialling in the tilt.
+    if (p_Guides != 0) {
+        float cellX = W / 12.0f;
+        float cellY = H / 8.0f;
+        float lw = _fmaxf(1.0f, H / 1080.0f);
+        float px = (float)p_X;
+        float py = (float)p_Y;
+        float dx = _fabs(px - cellX * _floorf(px / cellX + 0.5f));
+        float dy = _fabs(py - cellY * _floorf(py / cellY + 0.5f));
+        if (dx < lw || dy < lw) {
+            rgb = lerp3(rgb, make_float3(0.0f, 0.9f, 1.0f), 0.6f);
+        }
+    }
+
+    return rgb;
+}
